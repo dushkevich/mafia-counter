@@ -7,8 +7,13 @@ ROLE_SIDES: dict[str, str] = {
     "sheriff": "citizens",
     "doctor": "citizens",
     "beauty": "citizens",
+    "bodyguard": "citizens",
+    "prosecutor": "citizens",
+    "con_artist": "citizens",
+    "thief": "citizens",
     "mafia": "mafia",
     "don": "mafia",
+    "judge": "mafia",
     "maniac": "maniac",
 }
 
@@ -21,19 +26,32 @@ ROLE_LABELS: dict[str, str] = {
     "doctor": "Доктор",
     "beauty": "Красавица",
     "maniac": "Маньяк",
+    "judge": "Судья",
+    "bodyguard": "Телохранитель",
+    "prosecutor": "Прокурор",
+    "con_artist": "Аферист",
+    "thief": "Вор",
 }
 
 # Roles limited to at most 1 per game
-SINGLETON_ROLES: set[str] = {"don", "sheriff", "doctor", "beauty", "maniac"}
+SINGLETON_ROLES: set[str] = {
+    "don", "sheriff", "doctor", "beauty", "maniac",
+    "judge", "bodyguard", "prosecutor", "con_artist", "thief",
+}
 
 # Display order for role setup buttons
 ROLE_ORDER: list[str] = [
     "citizen",
     "mafia",
     "don",
+    "judge",
     "sheriff",
     "doctor",
     "beauty",
+    "bodyguard",
+    "prosecutor",
+    "con_artist",
+    "thief",
     "maniac",
 ]
 

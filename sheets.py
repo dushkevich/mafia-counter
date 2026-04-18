@@ -40,6 +40,11 @@ PLAYERS_HEADERS = [
     "don_games",
     "beauty_games",
     "maniac_games",
+    "judge_games",
+    "bodyguard_games",
+    "prosecutor_games",
+    "con_artist_games",
+    "thief_games",
     "created_at",
     "updated_at",
 ]
@@ -75,7 +80,33 @@ ROLE_STAT_COLUMN: dict[str, str] = {
     "doctor": "doctor_games",
     "beauty": "beauty_games",
     "maniac": "maniac_games",
+    "judge": "judge_games",
+    "bodyguard": "bodyguard_games",
+    "prosecutor": "prosecutor_games",
+    "con_artist": "con_artist_games",
+    "thief": "thief_games",
 }
+
+_INT_PLAYER_FIELDS = {
+    "games_played", "wins", "losses",
+    "mafia_games", "citizen_games", "sheriff_games", "doctor_games",
+    "don_games", "beauty_games", "maniac_games",
+    "judge_games", "bodyguard_games", "prosecutor_games", "con_artist_games", "thief_games",
+}
+_FLOAT_PLAYER_FIELDS = {"total_score"}
+
+
+def _coerce_player_record(r: dict) -> dict:
+    """Replace empty strings from gspread with numeric defaults so Pydantic can parse them."""
+    result = {}
+    for k, v in r.items():
+        if v == "" and k in _INT_PLAYER_FIELDS:
+            result[k] = 0
+        elif v == "" and k in _FLOAT_PLAYER_FIELDS:
+            result[k] = 0.0
+        else:
+            result[k] = v
+    return result
 
 
 class SheetsClient:
@@ -107,7 +138,7 @@ class SheetsClient:
         players = []
         for r in records:
             try:
-                players.append(Player(**r))
+                players.append(Player(**_coerce_player_record(r)))
             except Exception as e:
                 logger.warning("Skipping invalid player row: %s — %s", r, e)
         return players
@@ -116,57 +147,41 @@ class SheetsClient:
         return await asyncio.to_thread(self._sync_get_all_players)
 
     def _sync_get_player(self, username: str) -> Optional[Player]:
-        try:
-            cell = self._ws(TAB_PLAYERS).find(username, in_column=1)
-        except gspread.exceptions.CellNotFound:
-            return None
-        if cell is None:
-            return None
-        row_values = self._ws(TAB_PLAYERS).row_values(cell.row)
-        data = dict(zip(PLAYERS_HEADERS, row_values))
-        try:
-            return Player(**data)
-        except Exception as e:
-            logger.warning("Could not parse player row for %s: %s", username, e)
-            return None
+        records = self._ws(TAB_PLAYERS).get_all_records()
+        for r in records:
+            if r.get("telegram_username") == username:
+                try:
+                    return Player(**_coerce_player_record(r))
+                except Exception as e:
+                    logger.warning("Could not parse player %s: %s", username, e)
+                    return None
+        return None
 
     async def get_player(self, username: str) -> Optional[Player]:
         return await asyncio.to_thread(self._sync_get_player, username)
 
     def _sync_upsert_player(self, player: Player) -> None:
         ws = self._ws(TAB_PLAYERS)
+        actual_headers = ws.row_values(1)
+        col_index = {h: i + 1 for i, h in enumerate(actual_headers)}
+        player_dict = player.model_dump()
+
         try:
             cell = ws.find(player.telegram_username, in_column=1)
         except gspread.exceptions.CellNotFound:
             cell = None
 
-        row_data = [
-            player.telegram_username,
-            player.display_name,
-            player.games_played,
-            player.total_score,
-            player.wins,
-            player.losses,
-            player.mafia_games,
-            player.citizen_games,
-            player.sheriff_games,
-            player.doctor_games,
-            player.don_games,
-            player.beauty_games,
-            player.maniac_games,
-            player.created_at,
-            player.updated_at,
-        ]
-
         if cell is None:
+            row_data = [player_dict.get(h, "") for h in actual_headers]
             ws.append_row(row_data, value_input_option="USER_ENTERED")
         else:
-            end_col = chr(64 + len(row_data))  # e.g., 15 columns -> 'O'
-            ws.update(
-                f"A{cell.row}:{end_col}{cell.row}",
-                [row_data],
-                value_input_option="USER_ENTERED",
-            )
+            cell_updates = [
+                {"range": f"{_col_letter(col_index[field])}{cell.row}", "values": [[value]]}
+                for field, value in player_dict.items()
+                if field in col_index
+            ]
+            if cell_updates:
+                ws.batch_update(cell_updates, value_input_option="USER_ENTERED")
 
     async def upsert_player(self, player: Player) -> None:
         await asyncio.to_thread(self._sync_upsert_player, player)
@@ -235,7 +250,9 @@ class SheetsClient:
         username_to_row = {
             r["telegram_username"]: i + 2 for i, r in enumerate(all_records)
         }
-        col_index = {h: i + 1 for i, h in enumerate(PLAYERS_HEADERS)}
+        # Build col_index from actual sheet headers (order may differ from PLAYERS_HEADERS)
+        actual_headers = players_ws.row_values(1)
+        col_index = {h: i + 1 for i, h in enumerate(actual_headers)}
         now_iso = datetime.now(timezone.utc).isoformat()
 
         for p in participants:
@@ -292,8 +309,21 @@ class SheetsClient:
     # Sheet initialisation helper
     # ------------------------------------------------------------------
 
+    def _sync_ensure_columns(self, ws: gspread.Worksheet, headers: list[str]) -> None:
+        """Append any headers missing from row 1 of an existing worksheet."""
+        existing = ws.row_values(1)
+        missing = [h for h in headers if h not in existing]
+        if missing:
+            needed_cols = len(existing) + len(missing)
+            if ws.col_count < needed_cols:
+                ws.resize(rows=ws.row_count, cols=needed_cols)
+            next_col = len(existing) + 1
+            for i, h in enumerate(missing):
+                ws.update_cell(1, next_col + i, h)
+            logger.info("Added missing columns to %s: %s", ws.title, missing)
+
     def _sync_ensure_sheets(self) -> None:
-        """Create missing tabs with header rows. Safe to call on startup."""
+        """Create missing tabs and migrate existing ones with new columns. Safe to call on startup."""
         spreadsheet = self._get_spreadsheet()
         existing = {ws.title for ws in spreadsheet.worksheets()}
 
@@ -302,6 +332,8 @@ class SheetsClient:
                 ws = spreadsheet.add_worksheet(title=name, rows=1000, cols=len(headers))
                 ws.append_row(headers)
                 logger.info("Created sheet tab: %s", name)
+            else:
+                self._sync_ensure_columns(spreadsheet.worksheet(name), headers)
 
         _init_tab(TAB_PLAYERS, PLAYERS_HEADERS)
         _init_tab(TAB_GAMES, GAMES_HEADERS)

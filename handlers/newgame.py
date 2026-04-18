@@ -1,13 +1,15 @@
 """ConversationHandler for /newgame — the core game flow.
 
 States (in order):
-    ASK_PLAYER_COUNT   — choose number of players
-    SELECT_PLAYERS     — pick players from the Google Sheets list
+    ASK_PLAYER_COUNT    — choose number of players
+    SELECT_PLAYERS      — pick players from the Google Sheets list
     ADD_PLAYER_USERNAME — enter username for a new player
-    ADD_PLAYER_NAME    — enter display name for a new player
-    SETUP_ROLES        — set how many of each role are in this game
-    ASSIGN_ROLES       — assign a role from the pool to each player
-    FINISH_GAME        — choose the winning side; persist results
+    ADD_PLAYER_NAME     — enter display name for a new player
+    SETUP_ROLES         — set how many of each role are in this game
+    ASSIGN_ROLES        — assign a role from the pool to each player
+    MARK_ALIVE_DEAD     — mark which players were eliminated before game end
+    ADJUST_BONUSES      — optionally add per-player bonus/penalty adjustments
+    FINISH_GAME         — choose the winning side; persist results
 """
 
 from __future__ import annotations
@@ -48,8 +50,10 @@ logger = logging.getLogger(__name__)
     ADD_PLAYER_NAME,
     SETUP_ROLES,
     ASSIGN_ROLES,
+    MARK_ALIVE_DEAD,
+    ADJUST_BONUSES,
     FINISH_GAME,
-) = range(7)
+) = range(9)
 
 # ---------------------------------------------------------------------------
 # Session helpers
@@ -213,12 +217,9 @@ async def _render_player_page(
     )
     markup = InlineKeyboardMarkup(keyboard)
 
-    # Both Message and CallbackQuery need different edit methods
     if hasattr(msg_or_query, "edit_message_text"):
-        # CallbackQuery
         await msg_or_query.edit_message_text(text, reply_markup=markup)
     else:
-        # Message (from text input transitions)
         await msg_or_query.edit_text(text, reply_markup=markup)
 
     return SELECT_PLAYERS
@@ -258,9 +259,7 @@ async def paginate_players(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def add_player_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text(
-        "Введи Telegram username нового игрока (без @):"
-    )
+    await query.edit_message_text("Введи Telegram username нового игрока (без @):")
     return ADD_PLAYER_USERNAME
 
 
@@ -371,11 +370,8 @@ def _validate_role_counts(
         if counts.get(role, 0) > 1:
             errors.append(f"Роль «{ROLE_LABELS[role]}» может быть только 1")
 
-    non_citizen_special = sum(
-        counts.get(r, 0)
-        for r in ["mafia", "don", "sheriff", "doctor", "beauty", "maniac"]
-    )
-    if non_citizen_special == 0:
+    non_citizen = sum(counts.get(r, 0) for r in ROLE_ORDER if r != "citizen")
+    if non_citizen == 0:
         warnings.append("Нет специальных ролей — все будут мирными")
 
     if counts.get("don", 0) > 0 and counts.get("mafia", 0) == 0:
@@ -504,7 +500,7 @@ async def _render_assign_next(
     idx: int = session["assignment_index"]
 
     if idx >= len(all_usernames):
-        return await _render_finish(query, context)
+        return await _init_alive_dead(query, context)
 
     current_username = all_usernames[idx]
     players_cache = {p["telegram_username"]: p for p in _players_cache(context)}
@@ -559,9 +555,177 @@ async def assign_role(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     await query.answer()
 
     if session["assignment_index"] >= len(session["selected_usernames"]):
-        return await _render_finish(query, context)
+        return await _init_alive_dead(query, context)
 
     return await _render_assign_next(query, context)
+
+
+# ---------------------------------------------------------------------------
+# State: MARK_ALIVE_DEAD
+# ---------------------------------------------------------------------------
+
+
+async def _init_alive_dead(
+    query: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    """Initialise alive_status (all alive) and adjustments (all 0), then render."""
+    session = get_session(context)
+    usernames: list[str] = session["selected_usernames"]
+    session["alive_status"] = {u: True for u in usernames}
+    session["adjustments"] = {u: 0.0 for u in usernames}
+    return await _render_alive_dead(query, context)
+
+
+async def _render_alive_dead(
+    query: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    session = get_session(context)
+    usernames: list[str] = session["selected_usernames"]
+    alive_status: dict[str, bool] = session["alive_status"]
+    players_cache = {p["telegram_username"]: p for p in _players_cache(context)}
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for username in usernames:
+        dn = players_cache.get(username, {}).get("display_name", username)
+        is_alive = alive_status.get(username, True)
+        label = f"{'✅' if is_alive else '☠️'} {dn}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"alive_toggle:{username}")])
+
+    keyboard.append([InlineKeyboardButton("✔ Подтвердить", callback_data="alive_done")])
+
+    text = "Отметь выбывших игроков (нажми чтобы переключить):"
+    if hasattr(query, "edit_message_text"):
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await query.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    return MARK_ALIVE_DEAD
+
+
+async def toggle_alive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    _, username = query.data.split(":", 1)
+    session = get_session(context)
+    alive_status: dict[str, bool] = session["alive_status"]
+    alive_status[username] = not alive_status.get(username, True)
+    await query.answer()
+    return await _render_alive_dead(query, context)
+
+
+async def alive_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await _render_adjust_list(query, context)
+
+
+# ---------------------------------------------------------------------------
+# State: ADJUST_BONUSES
+# ---------------------------------------------------------------------------
+
+
+async def _render_adjust_list(
+    query: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> int:
+    session = get_session(context)
+    usernames: list[str] = session["selected_usernames"]
+    assigned: dict[str, str] = session["assigned"]
+    adjustments: dict[str, float] = session["adjustments"]
+    players_cache = {p["telegram_username"]: p for p in _players_cache(context)}
+
+    keyboard: list[list[InlineKeyboardButton]] = []
+    for username in usernames:
+        dn = players_cache.get(username, {}).get("display_name", username)
+        role_label = ROLE_LABELS.get(assigned.get(username, ""), "?")
+        adj = adjustments.get(username, 0.0)
+        adj_str = f" [{adj:+.1f}]" if adj != 0.0 else ""
+        label = f"{dn} ({role_label}){adj_str}"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"adj_select:{username}")])
+
+    keyboard.append([InlineKeyboardButton("✔ Завершить", callback_data="adj_done")])
+
+    text = "Бонусы и штрафы (нажми на игрока чтобы изменить):"
+    if hasattr(query, "edit_message_text"):
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await query.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    return ADJUST_BONUSES
+
+
+async def _render_adjust_player(
+    query: object,
+    context: ContextTypes.DEFAULT_TYPE,
+    username: str,
+) -> int:
+    session = get_session(context)
+    assigned: dict[str, str] = session["assigned"]
+    adjustments: dict[str, float] = session["adjustments"]
+    players_cache = {p["telegram_username"]: p for p in _players_cache(context)}
+
+    dn = players_cache.get(username, {}).get("display_name", username)
+    role_label = ROLE_LABELS.get(assigned.get(username, ""), "?")
+    adj = adjustments.get(username, 0.0)
+
+    keyboard = [
+        [
+            InlineKeyboardButton("+0.3", callback_data=f"adj_delta:{username}:0.3"),
+            InlineKeyboardButton("+0.2", callback_data=f"adj_delta:{username}:0.2"),
+            InlineKeyboardButton("+0.1", callback_data=f"adj_delta:{username}:0.1"),
+        ],
+        [
+            InlineKeyboardButton("-0.1", callback_data=f"adj_delta:{username}:-0.1"),
+            InlineKeyboardButton("Удалён -0.2", callback_data=f"adj_delta:{username}:-0.2"),
+            InlineKeyboardButton("ППК -0.3", callback_data=f"adj_delta:{username}:-0.3"),
+        ],
+        [InlineKeyboardButton("← Назад", callback_data="adj_back")],
+    ]
+
+    text = (
+        f"👤 {dn} ({role_label})\n"
+        f"Текущая корректировка: {adj:+.1f}\n\n"
+        "Выбери изменение:"
+    )
+    if hasattr(query, "edit_message_text"):
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    else:
+        await query.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+    return ADJUST_BONUSES
+
+
+async def adjust_select(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    _, username = query.data.split(":", 1)
+    await query.answer()
+    return await _render_adjust_player(query, context, username)
+
+
+async def adjust_delta(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    parts = query.data.split(":", 2)  # adj_delta, username, delta
+    username = parts[1]
+    delta = float(parts[2])
+    session = get_session(context)
+    session["adjustments"][username] = round(
+        session["adjustments"].get(username, 0.0) + delta, 2
+    )
+    await query.answer()
+    return await _render_adjust_player(query, context, username)
+
+
+async def adjust_back(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await _render_adjust_list(query, context)
+
+
+async def adjust_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await _render_finish(query, context)
 
 
 # ---------------------------------------------------------------------------
@@ -575,12 +739,14 @@ async def _render_finish(
 ) -> int:
     session = get_session(context)
     assigned: dict[str, str] = session["assigned"]
+    alive_status: dict[str, bool] = session.get("alive_status", {})
     players_cache = {p["telegram_username"]: p for p in _players_cache(context)}
 
     lines = ["📋 Все роли назначены!\n"]
     for username, role in assigned.items():
         dn = players_cache.get(username, {}).get("display_name", username)
-        lines.append(f"  {dn}: {ROLE_LABELS[role]}")
+        alive_icon = "✅" if alive_status.get(username, True) else "☠️"
+        lines.append(f"  {alive_icon} {dn}: {ROLE_LABELS[role]}")
     lines.append("\nКто победил?")
 
     # Only show Maniac button if maniac is in the game
@@ -633,13 +799,17 @@ async def _commit_game_results(
     session = get_session(context)
     game_id = generate_game_id()
     assigned: dict[str, str] = session["assigned"]
+    alive_status: dict[str, bool] = session.get("alive_status", {})
+    adjustments: dict[str, float] = session.get("adjustments", {})
     players_cache = {p["telegram_username"]: p for p in _players_cache(context)}
     now_iso = datetime.now(timezone.utc).isoformat()
 
     participants: list[ParticipantResult] = []
     for username, role in assigned.items():
+        is_alive = alive_status.get(username, True)
+        adjustment = adjustments.get(username, 0.0)
         won = did_win(role, winner_side)
-        score = compute_score(role, won)
+        score = compute_score(role, winner_side, is_alive, adjustment)
         dn = players_cache.get(username, {}).get("display_name", username)
         participants.append(
             ParticipantResult(
@@ -648,6 +818,7 @@ async def _commit_game_results(
                 display_name=dn,
                 role=role,
                 side=get_side(role),
+                is_alive_end=is_alive,
                 score_delta=score,
                 won=won,
             )
@@ -673,9 +844,12 @@ async def _commit_game_results(
     ]
     for p in participants:
         status = "✅ Победа" if p.won else "❌ Поражение"
+        alive_icon = "✅" if p.is_alive_end else "☠️"
+        adj = adjustments.get(p.telegram_username, 0.0)
+        adj_str = f" (корр. {adj:+.1f})" if adj != 0.0 else ""
         lines.append(
-            f"  {p.display_name} ({ROLE_LABELS[p.role]}): "
-            f"{status} +{p.score_delta:.1f}"
+            f"  {alive_icon} {p.display_name} ({ROLE_LABELS[p.role]}): "
+            f"{status} {p.score_delta:+.1f}{adj_str}"
         )
     lines.append("\nИспользуй /newgame для следующей игры!")
 

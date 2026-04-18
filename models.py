@@ -25,6 +25,11 @@ class Role(str, Enum):
     DOCTOR = "doctor"
     BEAUTY = "beauty"
     MANIAC = "maniac"
+    JUDGE = "judge"
+    BODYGUARD = "bodyguard"
+    PROSECUTOR = "prosecutor"
+    CON_ARTIST = "con_artist"
+    THIEF = "thief"
 
 
 class Player(BaseModel):
@@ -41,6 +46,11 @@ class Player(BaseModel):
     don_games: int = 0
     beauty_games: int = 0
     maniac_games: int = 0
+    judge_games: int = 0
+    bodyguard_games: int = 0
+    prosecutor_games: int = 0
+    con_artist_games: int = 0
+    thief_games: int = 0
     created_at: str = Field(default_factory=lambda: utcnow().isoformat())
     updated_at: str = Field(default_factory=lambda: utcnow().isoformat())
 
@@ -67,6 +77,12 @@ class GameSession(BaseModel):
     role_pool: list[str] = Field(default_factory=list)
     assigned: dict[str, str] = Field(default_factory=dict)  # username -> role
     assignment_index: int = 0
+
+    # Phase: alive/dead marking
+    alive_status: dict[str, bool] = Field(default_factory=dict)  # username → is_alive
+
+    # Phase: bonus/penalty adjustments
+    adjustments: dict[str, float] = Field(default_factory=dict)  # username → score delta
 
     # Outcome
     winner_side: Optional[str] = None
