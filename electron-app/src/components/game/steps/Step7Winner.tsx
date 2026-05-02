@@ -29,11 +29,11 @@ export default function Step7Winner() {
       </div>
 
       <div className="flex justify-between">
-        <button onClick={() => setStep(6)} className="px-5 py-2 rounded-lg bg-slate-700 text-slate-300 hover:bg-slate-600 text-sm">
+        <button onClick={() => setStep(5)} className="px-5 py-2 rounded-lg bg-slate-700 text-slate-300 hover:bg-slate-600 text-sm">
           ← Назад
         </button>
         <button
-          onClick={() => setStep(8)}
+          onClick={() => setStep(7)}
           disabled={!winnerSide}
           className="px-8 py-2 rounded-lg bg-indigo-600 text-white font-semibold hover:bg-indigo-500 disabled:opacity-40 disabled:cursor-not-allowed text-sm"
         >

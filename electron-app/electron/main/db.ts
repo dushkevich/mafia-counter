@@ -163,17 +163,6 @@ export function commitGame(payload: GameCommitPayload): GameResult {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
 
-    const updatePlayer = db.prepare(
-      `UPDATE players SET
-         games_played = games_played + 1,
-         total_score  = ROUND(total_score + ?, 2),
-         wins         = wins + ?,
-         losses       = losses + ?,
-         ${''/* role column updated below */}
-         updated_at   = datetime('now')
-       WHERE id = ?`
-    )
-
     for (const r of results) {
       const side = ROLE_SIDES[r.role] ?? 'citizens'
       insertPart.run(

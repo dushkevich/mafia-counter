@@ -8,10 +8,10 @@ interface GameStore {
   selectedPlayers: Player[]
   roleCounts: Record<string, number>
   rolePool: string[]
-  assigned: Record<string, string>       // playerName → role
+  assigned: Record<string, string>
   assignmentIndex: number
-  aliveStatus: Record<string, boolean>   // playerName → isAlive
-  adjustments: Record<string, number>    // playerName → delta
+  aliveStatus: Record<string, boolean>
+  adjustments: Record<string, number>
   winnerSide: string | null
   lastResult: import('../types').GameResult | null
 
@@ -23,6 +23,7 @@ interface GameStore {
   assignNextRole: (role: string) => void
   toggleAlive: (playerName: string) => void
   setAdjustment: (playerName: string, delta: number) => void
+  clearAdjustment: (playerName: string) => void
   setWinner: (side: string) => void
   setLastResult: (result: import('../types').GameResult) => void
   reset: () => void
@@ -82,8 +83,12 @@ export const useGameStore = create<GameStore>((set, get) => ({
     set({ adjustments: { ...adjustments, [playerName]: Math.round((current + delta) * 100) / 100 } })
   },
 
+  clearAdjustment: (playerName) => {
+    const { adjustments } = get()
+    set({ adjustments: { ...adjustments, [playerName]: 0 } })
+  },
+
   setWinner: (side) => set({ winnerSide: side }),
   setLastResult: (result) => set({ lastResult: result }),
-
   reset: () => set(initialState),
 }))
