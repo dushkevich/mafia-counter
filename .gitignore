@@ -2,6 +2,8 @@
 .env
 *.json
 !package.json
+!tsconfig*.json
+!package-lock.json
 
 # Python
 __pycache__/
